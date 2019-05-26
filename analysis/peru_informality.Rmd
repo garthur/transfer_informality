@@ -1,0 +1,190 @@
+---
+title: "Informality in Peru"
+author: "Graham Arthur (garthur)"
+date: "May 9, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE)
+
+library(forecast)
+library(TSA)
+library(dplyr)
+library(ggplot2)
+```
+
+# Data
+
+```{r read-data}
+e = data.table::fread("wdi_elec.csv", sep=",", skip="Country Name", header=TRUE)
+gdp = data.table::fread("wdi_gdp.csv", sep=",", skip="Country Name", header=TRUE)
+
+# select a country of interest
+target_country = "Peru"
+e = e %>% filter(`Country Name` == target_country) %>% 
+  select(-c(`Country Name`, `Country Code`, `Indicator Name`, `Indicator Code`)) %>%
+  select_if(~sum(!is.na(.)) > 0) %>%
+  tidyr::gather(key = "year", value = "kwh", convert = TRUE) 
+gdp = gdp %>% filter(`Country Name` == target_country) %>% 
+  select(-c(`Country Name`, `Country Code`, `Indicator Name`, `Indicator Code`)) %>%
+  select_if(~sum(!is.na(.)) > 0) %>%
+  tidyr::gather(key = "year", value = "gdp", convert = TRUE)
+
+
+# change to ts
+e = ts(e[,"kwh"], frequency = 1, start = min(e[,"year"]))
+gdp = ts(gdp[,"gdp"], frequency = 1, start = min(gdp[,"year"]))
+
+# make sure they start at the same time
+dat = ts.intersect(e, gdp)
+```
+
+# Electricity
+
+```{r e_tsdisplay}
+ggtsdisplay(dat[,1], main="Electricity Index", theme=ggplot2::theme_bw(), points=F)
+```
+
+# GDP
+
+```{r gdp_tsdisplay}
+ggtsdisplay(dat[,2], main="GDP", theme=ggplot2::theme_bw(), points=F)
+```
+
+```{r log_diff_gdp}
+l.gdp = log(dat[,2])
+ggtsdisplay(log(dat[,2]), main="Log GDP", theme=ggplot2::theme_bw(), points=F)
+```
+
+# Transfer Model  {.tabset .tabset-pills}
+
+We have to identify order processes for and GDP, and then we define the order of transfer.
+
+## GDP Fit
+
+```{r}
+(model.gdp = auto.arima(dat[,2], approximation=F, seasonal=T, allowdrift=F))
+```
+
+## Electricity Fit
+```{r}
+(model.e = auto.arima(dat[,1], approximation=F, seasonal=T, allowdrift=F))
+```
+
+## Transfer Order
+
+```{r ccf}
+ccf(residuals(model.e), residuals(model.gdp), lag.max = 20, main="Elec. vs. GDP", ylab="CCF")
+```
+
+A transfer order of at most 1 looks okay.
+
+## Transfer Fit {.tabset}
+
+Identify a transfer order using CCF.
+
+```{r}
+(transfer.mod = arimax(dat[,2], order=arimaorder(model.gdp),
+                       xtransf=dat[,1], transfer=list(c(1,0)),
+                       optim.control = list(maxit = 1000), method="ML",
+                       transform.pars=TRUE))
+```
+
+### Residuals {.tabset}
+
+```{r resid_tsdisplay}
+ggtsdisplay(residuals(transfer.mod), main="Transfer Residuals", theme=ggplot2::theme_bw(), points=F)
+```
+
+#### White Noise
+
+```{r}
+Box.test(residuals(transfer.mod), lag = 20, type="Ljung-Box")
+```
+
+#### Gaussianity
+
+```{r resid_qq}
+qqnorm(residuals(transfer.mod), pch=16); qqline(residuals(transfer.mod));
+```
+
+Let's do a real test.
+
+```{r}
+tseries::jarque.bera.test(residuals(transfer.mod))
+```
+
+### Fitted Values
+
+```{r fitted_gdp}
+plot_frame = data.frame(t = time(dat[,2]), 
+                        gdp = dat[,2], 
+                        gdp_hat = fitted.values(transfer.mod)
+)
+
+library(ggplot2)
+ggplot(plot_frame) + 
+  geom_line(aes(x=t, y=gdp, color="Actual"), size=1, alpha=0.7) +
+  geom_line(aes(x=t, y=gdp_hat, color="Fitted"), size=1, alpha=0.5) +
+  scale_color_manual("", values=c("black", "#419192")) +
+  labs(x="Years", y="GDP per Capita", title="Transfer Model Fitted Values") +
+  theme_bw()
+```
+
+# Informality {.tabset .tabset-pills}
+
+## Absolute Informality  {.tabset}
+
+### Raw
+
+```{r}
+informal.size = plot_frame$gdp_hat - plot_frame$gdp
+plot_frame$y = informal.size
+ggplot(plot_frame, aes(x = t, y = y)) +
+  geom_step(size = 1.05) +
+  geom_hline(yintercept = 0, linetype = 2, size = 1.1, color = "#419192") + 
+  labs(x = "Years", y ="GDP Per Capita", 
+       title="Predicted Size of the Informal Market") +
+  theme_bw()
+```
+
+### Zero-Truncated
+
+```{r}
+plot_frame$y = ifelse(informal.size < 0, 0, informal.size)
+ggplot(plot_frame, aes(x = t, y = y)) +
+  geom_step(size = 1.05) +
+  labs(x = "Years", y ="GDP Per Capita", 
+       title="Predicted Size of the Informal Market") +
+  theme_bw()
+```
+
+## Relative Informality {.tabset}
+
+### Raw
+
+```{r}
+rel.informal.size = (plot_frame$gdp_hat - plot_frame$gdp)/plot_frame$gdp
+plot_frame$y = rel.informal.size
+ggplot(plot_frame, aes(x = t, y = y)) +
+  geom_step(size = 1.05) +
+  geom_hline(yintercept = 0, linetype = 2, size = 1.1, color = "#419192") + 
+  labs(x = "Years", y ="Proportion of GDP per Capita", 
+       title="Relative Size of the Informal Market") +
+  theme_bw()
+```
+
+### Zero-Truncated
+
+```{r}
+plot_frame$y = ifelse(rel.informal.size < 0, 0, rel.informal.size)
+ggplot(plot_frame, aes(x = t, y = y)) +
+  geom_step(size = 1.05) +
+  labs(x = "Years", y ="GDP Per Capita", 
+       title="Relative Size of the Informal Market") +
+  theme_bw()
+```
+
+
+
